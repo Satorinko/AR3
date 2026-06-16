@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>AR 背景オクルージョン</title>
+  <title>AR 背景オクルージョン（完全版）</title>
   <script src="https://aframe.io/releases/1.2.0/aframe.min.js"></script>
   <script src="https://raw.githack.com/AR-js-org/AR.js/master/aframe/build/aframe-ar.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
@@ -33,31 +33,30 @@
     #snap-btn:active {
       background-color: #ff1493;
     }
-    /* 人物マスク合成用の隠しキャンバス */
-    #occlusion-canvas {
+    /* 一番手前に重ねる、人間だけを描画するキャンバス */
+    #person-overlay-canvas {
       position: fixed;
       top: 0;
       left: 0;
       width: 100%;
       height: 100%;
-      z-index: 1; /* カメラとARの間に挟む */
-      pointer-events: none;
+      z-index: 999; /* ARシーン(A-Frame)よりも手前に配置 */
+      pointer-events: none; /* タッチイベントを貫通させてAR操作を可能にする */
     }
-    /* ARシーンを前面に */
     a-scene {
       position: absolute;
       top: 0;
       left: 0;
       width: 100%;
       height: 100%;
-      z-index: 2;
+      z-index: 1;
     }
   </style>
 </head>
 <body>
 
   <button id="snap-btn">写真を撮る</button>
-  <canvas id="occlusion-canvas"></canvas>
+  <canvas id="person-overlay-canvas"></canvas>
 
   <a-scene embedded arjs="sourceType: webcam; debugUIEnabled: false;" screenshot>
     <a-assets>
@@ -71,17 +70,22 @@
 
 <script>
 // ==========================================
-// 1. 人物セグメンテーション（マスク処理）
+// 1. リアルタイム人物切り抜き＆最前面描画処理
 // ==========================================
-const canvas = document.getElementById('occlusion-canvas');
-const ctx = canvas.getContext('2d');
+const overlayCanvas = document.getElementById('person-overlay-canvas');
+const oCtx = overlayCanvas.getContext('2d');
+
+// 一時処理用の隠しキャンバス
+const hiddenCanvas = document.createElement('canvas');
+const hCtx = hiddenCanvas.getContext('2d');
+
 let bpModel = null;
 
-// BodyPixモデルの読み込み
+// AIモデル（BodyPix）の読み込み
 bodyPix.load({
   architecture: 'MobileNetV1',
   outputStride: 16,
-  multiplier: 0.75,
+  multiplier: 0.50, // 処理軽量化のため少し下げています
   quantBytes: 2
 }).then(model => {
   bpModel = model;
@@ -91,53 +95,58 @@ bodyPix.load({
 function startOcclusionLoop() {
   const video = document.querySelector('video');
   if (!video) {
-    setTimeout(startOcclusionLoop, 500);
+    // カメラ（video要素）が生成されるまで待つ
+    setTimeout(startOcclusionLoop, 100);
     return;
   }
 
-  // 元のカメラ映像をブラウザ標準で非表示にし、背後のcanvasで制御
-  video.style.opacity = "0";
-
   async function render() {
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      
+      if (overlayCanvas.width !== width || overlayCanvas.height !== height) {
+        overlayCanvas.width = width;
+        overlayCanvas.height = height;
+        hiddenCanvas.width = width;
+        hiddenCanvas.height = height;
+      }
 
-      // 1. まずカメラ映像を全面に描画
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      // 1. 隠しキャンバスに現在のカメラ映像をそのまま描画
+      hCtx.drawImage(video, 0, 0, width, height);
 
-      // 2. 人物を検知してマスクを作成
       try {
+        // 2. AIで人物の領域（マスク）を検出
         const segmentation = await bpModel.segmentPerson(video, {
           flipHorizontal: false,
-          internalResolution: 'medium',
-          segmentationThreshold: 0.7
+          internalResolution: 'low', // 速度優先
+          segmentationThreshold: 0.6
         });
 
-        // 3. 人物の部分だけをカメラ映像から切り抜いてARオブジェクトの手前に重ねる
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        // 3. カメラ映像のピクセルデータを取得
+        const imgData = hCtx.getImageData(0, 0, width, height);
         const data = imgData.data;
-        
-        // BodyPixの出力を画面サイズにリサイズしながらマスク適用
-        for (let y = 0; y < canvas.height; y++) {
-          for (let x = 0; x < canvas.width; x++) {
-            const vx = Math.floor(x * (segmentation.width / canvas.width));
-            const vy = Math.floor(y * (segmentation.height / canvas.height));
+
+        // 4. 人物以外のエリア（背景）の透明度（Alpha）を0にする
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const vx = Math.floor(x * (segmentation.width / width));
+            const vy = Math.floor(y * (segmentation.height / height));
             const segIndex = vy * segmentation.width + vx;
             
-            const pixelIndex = (y * canvas.width + x) * 4;
-            // 人物ではないエリア（背景）は透明にする
+            const pixelIndex = (y * width + x) * 4;
+            
+            // 値が 0 の場所は「背景（人じゃない）」なので透明にする
             if (segmentation.data[segIndex] === 0) {
-              data[pixelIndex + 3] = 0; // Alphaを0に
+              data[pixelIndex + 3] = 0; 
             }
           }
         }
-        
-        // 一度キャンバスをクリアしてARの下に敷くカメラ映像を描画したあと、
-        // ARの上に重ねるための人物だけのレイヤーを最前面に持ってくる処理を擬似的に行うため、
-        // A-Frame側のブレンドモードを利用するか、CSSのz-indexとCanvasを分けます。
-        // ここでは、単純に「ARオブジェクトの背後に回す」ため、A-Frameのカメラ背景として
-        // 処理するのが理想ですが、最も簡単なのは「人の部分だけをARの上に重ねるスタンプ」を毎フレーム作る方法です。
+
+        // 5. 切り抜いた「人間だけ」を、ARの上にある最前面キャンバスに描画！
+        oCtx.clearRect(0, 0, width, height);
+        oCtx.putImageData(imgData, 0, 0);
+
       } catch (e) {
         console.error(e);
       }
@@ -213,23 +222,28 @@ document.getElementById('snap-btn').addEventListener('click', function() {
     return;
   }
   const targetCanvas = scene.components.screenshot.getCanvas('perspective');
+  const video = document.querySelector('video');
   
   const mergeCanvas = document.createElement('canvas');
   mergeCanvas.width = window.innerWidth;
   mergeCanvas.height = window.innerHeight;
   const mCtx = mergeCanvas.getContext('2d');
   
-  // 1. 背景のカメラ映像（occlusion-canvasの内容）を描画
-  mCtx.drawImage(canvas, 0, 0);
-  // 2. ARオブジェクトを描画
+  // 1. 一番後ろに「生のカメラ映像」を描画
+  if (video) {
+    mCtx.drawImage(video, 0, 0, window.innerWidth, window.innerHeight);
+  }
+  // 2. 真ん中に「ARオブジェクト（エジプト画像）」を描画
   if (targetCanvas) {
     mCtx.drawImage(targetCanvas, 0, 0, window.innerWidth, window.innerHeight);
   }
+  // 3. 一番手前に「切り抜いた人間」を描画して合成
+  mCtx.drawImage(overlayCanvas, 0, 0);
   
   try {
     const imgData = mergeCanvas.toDataURL('image/png');
     const link = document.createElement('a');
-    link.download = 'ar-bg-photo_' + Date.now() + '.png';
+    link.download = 'ar-back-photo_' + Date.now() + '.png';
     link.href = imgData;
     link.click();
   } catch (e) {
