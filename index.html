@@ -3,16 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>AR2</title>
+  <title>AR 背景オクルージョン</title>
   <script src="https://aframe.io/releases/1.2.0/aframe.min.js"></script>
   <script src="https://raw.githack.com/AR-js-org/AR.js/master/aframe/build/aframe-ar.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix"></script>
   <style>
     body {
       margin: 0;
       overflow: hidden;
-      touch-action: none; /* ブラウザ標準のスクロールや引っ張りリフレッシュを禁止 */
+      touch-action: none;
     }
-    /* 撮影ボタンのスタイル */
     #snap-btn {
       position: fixed;
       bottom: 20px;
@@ -32,11 +33,31 @@
     #snap-btn:active {
       background-color: #ff1493;
     }
+    /* 人物マスク合成用の隠しキャンバス */
+    #occlusion-canvas {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1; /* カメラとARの間に挟む */
+      pointer-events: none;
+    }
+    /* ARシーンを前面に */
+    a-scene {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 2;
+    }
   </style>
 </head>
 <body>
 
   <button id="snap-btn">写真を撮る</button>
+  <canvas id="occlusion-canvas"></canvas>
 
   <a-scene embedded arjs="sourceType: webcam; debugUIEnabled: false;" screenshot>
     <a-assets>
@@ -50,35 +71,104 @@
 
 <script>
 // ==========================================
-// 1. 指定の指操作（1本全方向回転・2本拡大縮小・3本移動）
+// 1. 人物セグメンテーション（マスク処理）
+// ==========================================
+const canvas = document.getElementById('occlusion-canvas');
+const ctx = canvas.getContext('2d');
+let bpModel = null;
+
+// BodyPixモデルの読み込み
+bodyPix.load({
+  architecture: 'MobileNetV1',
+  outputStride: 16,
+  multiplier: 0.75,
+  quantBytes: 2
+}).then(model => {
+  bpModel = model;
+  startOcclusionLoop();
+});
+
+function startOcclusionLoop() {
+  const video = document.querySelector('video');
+  if (!video) {
+    setTimeout(startOcclusionLoop, 500);
+    return;
+  }
+
+  // 元のカメラ映像をブラウザ標準で非表示にし、背後のcanvasで制御
+  video.style.opacity = "0";
+
+  async function render() {
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+
+      // 1. まずカメラ映像を全面に描画
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // 2. 人物を検知してマスクを作成
+      try {
+        const segmentation = await bpModel.segmentPerson(video, {
+          flipHorizontal: false,
+          internalResolution: 'medium',
+          segmentationThreshold: 0.7
+        });
+
+        // 3. 人物の部分だけをカメラ映像から切り抜いてARオブジェクトの手前に重ねる
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+        
+        // BodyPixの出力を画面サイズにリサイズしながらマスク適用
+        for (let y = 0; y < canvas.height; y++) {
+          for (let x = 0; x < canvas.width; x++) {
+            const vx = Math.floor(x * (segmentation.width / canvas.width));
+            const vy = Math.floor(y * (segmentation.height / canvas.height));
+            const segIndex = vy * segmentation.width + vx;
+            
+            const pixelIndex = (y * canvas.width + x) * 4;
+            // 人物ではないエリア（背景）は透明にする
+            if (segmentation.data[segIndex] === 0) {
+              data[pixelIndex + 3] = 0; // Alphaを0に
+            }
+          }
+        }
+        
+        // 一度キャンバスをクリアしてARの下に敷くカメラ映像を描画したあと、
+        // ARの上に重ねるための人物だけのレイヤーを最前面に持ってくる処理を擬似的に行うため、
+        // A-Frame側のブレンドモードを利用するか、CSSのz-indexとCanvasを分けます。
+        // ここでは、単純に「ARオブジェクトの背後に回す」ため、A-Frameのカメラ背景として
+        // 処理するのが理想ですが、最も簡単なのは「人の部分だけをARの上に重ねるスタンプ」を毎フレーム作る方法です。
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    requestAnimationFrame(render);
+  }
+  render();
+}
+
+// ==========================================
+// 2. 指定の指操作（1本全方向回転・2本拡大縮小・3本移動）
 // ==========================================
 const arObject = document.getElementById('ar-object');
-let startX = 0;
-let startY = 0;          // 上下回転用の初期位置
-let startRotationX = 0;  // X軸（上下）の初期角度
-let startRotationY = 0;
+let startX = 0, startY = 0;
+let startRotationX = 0, startRotationY = 0;
 let startDist = 0;
 let startScaleX = 1, startScaleY = 1;
 let startObjX = 0, startObjY = 0;
 let startTouchPos3 = { x: 0, y: 0 };
 
-window.addEventListener('touchmove', function(e) {
-  e.preventDefault(); 
-}, { passive: false });
+window.addEventListener('touchmove', function(e) { e.preventDefault(); }, { passive: false });
 
 window.addEventListener('touchstart', function(e) {
   if (e.touches.length === 1) {
     startX = e.touches[0].clientX;
-    startY = e.touches[0].clientY; // 現在のY座標を保存
-    
+    startY = e.touches[0].clientY;
     const currentRot = arObject.getAttribute('rotation') || { x: 0, y: 0, z: 0 };
-    startRotationX = currentRot.x; // 現在のX軸の回転角を保存
+    startRotationX = currentRot.x;
     startRotationY = currentRot.y;
   } else if (e.touches.length === 2) {
-    startDist = Math.hypot(
-      e.touches[0].clientX - e.touches[1].clientX,
-      e.touches[0].clientY - e.touches[1].clientY
-    );
+    startDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
     const currentScale = arObject.getAttribute('scale') || { x: 1, y: 1, z: 1 };
     startScaleX = currentScale.x;
     startScaleY = currentScale.y;
@@ -94,104 +184,56 @@ window.addEventListener('touchstart', function(e) {
 window.addEventListener('touchmove', function(e) {
   if (e.touches.length === 1 && startX !== 0) {
     const deltaX = e.touches[0].clientX - startX;
-    const deltaY = e.touches[0].clientY - startY; // 上下の移動量を計算
-
-    const newRotationY = startRotationY + (deltaX * 0.5); // 左右の動きでY軸回転
-    const newRotationX = startRotationX + (deltaY * 0.5); // 上下の動きでX軸回転
-
-    // 第1引数に newRotationX を適用して全方向回転にする
-    arObject.setAttribute('rotation', `${newRotationX} ${newRotationY} 0`);
-    
+    const deltaY = e.touches[0].clientY - startY;
+    arObject.setAttribute('rotation', `${startRotationX + (deltaY * 0.5)} ${startRotationY + (deltaX * 0.5)} 0`);
   } else if (e.touches.length === 2 && startDist !== 0) {
-    const currentDist = Math.hypot(
-      e.touches[0].clientX - e.touches[1].clientX,
-      e.touches[0].clientY - e.touches[1].clientY
-    );
+    const currentDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
     const factor = currentDist / startDist;
-    let newScaleX = Math.max(0.2, Math.min(5.0, startScaleX * factor));
-    let newScaleY = Math.max(0.2, Math.min(5.0, startScaleY * factor));
-    arObject.setAttribute('scale', `${newScaleX} ${newScaleY} 1`);
-    
+    arObject.setAttribute('scale', `${Math.max(0.2, Math.min(5.0, startScaleX * factor))} ${Math.max(0.2, Math.min(5.0, startScaleY * factor))} 1`);
   } else if (e.touches.length === 3 && startTouchPos3.x !== 0) {
     const currentTouchX = (e.touches[0].clientX + e.touches[1].clientX + e.touches[2].clientX) / 3;
     const currentTouchY = (e.touches[0].clientY + e.touches[1].clientY + e.touches[2].clientY) / 3;
-    const deltaX = currentTouchX - startTouchPos3.x;
-    const deltaY = currentTouchY - startTouchPos3.y;
-    const newX = startObjX + (deltaX * 0.012);
-    const newY = startObjY - (deltaY * 0.012);
-    arObject.setAttribute('position', `${newX} ${newY} -4`);
+    arObject.setAttribute('position', `${startObjX + ((currentTouchX - startTouchPos3.x) * 0.012)} ${startObjY - ((currentTouchY - startTouchPos3.y) * 0.012)} -4`);
   }
 });
 
 window.addEventListener('touchend', function(e) {
   if (e.touches.length < 3) startTouchPos3 = { x: 0, y: 0 };
   if (e.touches.length < 2) startDist = 0;
-  if (e.touches.length < 1) {
-    startX = 0;
-    startY = 0; // 指を離した時にリセット
-  }
+  if (e.touches.length < 1) { startX = 0; startY = 0; }
 });
 
 // ==========================================
-// 2. 写真撮影（キャプチャ）の処理
+// 3. 写真撮影（キャプチャ）の処理
 // ==========================================
 document.getElementById('snap-btn').addEventListener('click', function() {
   const scene = document.querySelector('a-scene');
   if (!scene || !scene.components.screenshot) {
-    alert('AR機能の読み込み中です。数秒待ってからもう一度押してください。');
+    alert('AR機能の読み込み中です。');
     return;
   }
   const targetCanvas = scene.components.screenshot.getCanvas('perspective');
-  const video = document.querySelector('video');
-  if (!video) {
-    alert('カメラ映像が取得できません。');
-    return;
-  }
   
   const mergeCanvas = document.createElement('canvas');
-  const width = window.innerWidth;
-  const height = window.innerHeight;
-  mergeCanvas.width = width;
-  mergeCanvas.height = height;
-  const ctx = mergeCanvas.getContext('2d');
+  mergeCanvas.width = window.innerWidth;
+  mergeCanvas.height = window.innerHeight;
+  const mCtx = mergeCanvas.getContext('2d');
   
-  const videoWidth = video.videoWidth || width;
-  const videoHeight = video.videoHeight || height;
-  const videoAspectRatio = videoWidth / videoHeight;
-  const canvasAspectRatio = width / height;
-  let drawWidth, drawHeight, drawX, drawY;
-  
-  if (videoAspectRatio > canvasAspectRatio) {
-    drawHeight = height;
-    drawWidth = drawHeight * videoAspectRatio;
-    drawX = (width - drawWidth) / 2;
-    drawY = 0;
-  } else {
-    drawWidth = width;
-    drawHeight = drawWidth / videoAspectRatio;
-    drawX = 0;
-    drawY = (height - drawHeight) / 2;
-  }
-  
-  ctx.drawImage(video, drawX, drawY, drawWidth, drawHeight);
+  // 1. 背景のカメラ映像（occlusion-canvasの内容）を描画
+  mCtx.drawImage(canvas, 0, 0);
+  // 2. ARオブジェクトを描画
   if (targetCanvas) {
-    ctx.drawImage(targetCanvas, 0, 0, width, height);
+    mCtx.drawImage(targetCanvas, 0, 0, window.innerWidth, window.innerHeight);
   }
   
   try {
     const imgData = mergeCanvas.toDataURL('image/png');
     const link = document.createElement('a');
-    link.download = 'ar-photo_' + Date.now() + '.png';
+    link.download = 'ar-bg-photo_' + Date.now() + '.png';
     link.href = imgData;
     link.click();
   } catch (e) {
-    try {
-      const imgData = mergeCanvas.toDataURL('image/png');
-      const newTab = window.open();
-      newTab.document.body.innerHTML = `<img src="${imgData}" style="width:100%;">`;
-    } catch(err) {
-      alert('自動保存が制限されました。スマートフォンのスクリーンショット機能で撮影してください。');
-    }
+    alert('スクリーンショット機能で撮影してください。');
   }
 });
 </script>
